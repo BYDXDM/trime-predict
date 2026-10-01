@@ -105,6 +105,17 @@ class PredictDb : public MappedFile {
   bool has_codes_ = false;
 };
 
+/**
+ * 由文本训练数据直接构建 predict.db。
+ *
+ * 输入每行：<上文词>\t<候选词>\t<权重>[\t<拼音编码>]，见 tools/build_predict.cc。
+ * 出现编码即用 v2 格式，否则退回 v1。
+ *
+ * 单独抽成函数是为了让 Android 侧也能在**设备上**生成词库（JNI 调用），
+ * 从而摆脱「必须用宿主 C++ 工具构建」的限制。
+ */
+bool BuildPredictDbFromText(const string& text, const path& db_path);
+
 }  // namespace rime
 
 #endif  // RIME_PREDICT_DB_H_

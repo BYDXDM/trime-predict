@@ -117,7 +117,7 @@ bool PredictDb::Build(const predict::RawData& data) {
   }
 
   // copy from entry vector to entry array
-  const table::Entry* available_entries = &entries[0];
+  const table::Entry* available_entries = entries.empty() ? nullptr : &entries[0];
   vector<int> values;
   values.reserve(data_size);
   for (const auto& kv : data) {
@@ -235,7 +235,7 @@ bool PredictDb::BuildV2(const predict::RawData& data,
     return false;
   }
 
-  const table::Entry* available_entries = &entries[0];
+  const table::Entry* available_entries = entries.empty() ? nullptr : &entries[0];
   vector<int> values;
   values.reserve(data_size);
   for (const auto& kv : data) {
@@ -259,7 +259,9 @@ bool PredictDb::BuildV2(const predict::RawData& data,
                                        available_entries));
     available_entries += kv.second.size();
   }
-  // 用「词 + 其所有编码」建前缀树，这样查询既能整词命中也能按输入前缀命中
+  // 查询键就是「上一个上屏词」（或 $ 表示句首）。Darts 的 exactMatchSearch
+  // 只做整串匹配，所以这里只登记原样的键 —— 「打一半 / 只打首字母」不是靠
+  // 查询键前缀，而是 LookupRanked 里用当前输入对候选编码分档实现的。
   vector<const char*> indexed_keys;
   vector<int> indexed_values;
   for (size_t n = 0; n < keys.size(); ++n) {
@@ -267,6 +269,10 @@ bool PredictDb::BuildV2(const predict::RawData& data,
       continue;
     indexed_keys.push_back(keys[n]);
     indexed_values.push_back(values[n]);
+  }
+  if (indexed_keys.empty()) {
+    LOG(ERROR) << "no usable prediction keys.";
+    return false;
   }
   if (0 != key_trie_->build(indexed_keys.size(), indexed_keys.data(), NULL,
                             indexed_values.data())) {
@@ -356,6 +362,91 @@ vector<PredictDb::RankedEntry> PredictDb::LookupRanked(const string& key,
                      return a.weight > b.weight;
                    });
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// 文本 → 词库。与 tools/build_predict.cc 共用同一套解析规则，
+// 这样命令行工具与设备端生成的结果完全一致。
+// ---------------------------------------------------------------------------
+static void SplitCodeIntoBoundaries(const string& code, vector<int>* bounds) {
+  size_t pos = 0;
+  while (pos <= code.size()) {
+    size_t space = code.find(' ', pos);
+    size_t end = (space == string::npos) ? code.size() : space;
+    if (end > pos) {
+      bounds->push_back(int(pos));
+      bounds->push_back(int(end));
+    }
+    if (space == string::npos)
+      break;
+    pos = space + 1;
+  }
+}
+
+bool BuildPredictDbFromText(const string& text, const path& db_path) {
+  predict::RawData data;
+  map<string, string> codes;
+  map<string, vector<int>> code_boundaries;
+  bool has_v2 = false;
+
+  size_t start = 0;
+  while (start <= text.size()) {
+    size_t nl = text.find('\n', start);
+    string line =
+        text.substr(start, (nl == string::npos) ? string::npos : nl - start);
+    start = (nl == string::npos) ? text.size() + 1 : nl + 1;
+    // 去掉行尾 \r（Windows 生成的训练数据）
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+      line.pop_back();
+    if (line.empty() || line[0] == '#')
+      continue;
+
+    // 按制表符分列；不足 3 列的行直接跳过
+    vector<string> cols;
+    size_t p = 0;
+    while (p <= line.size()) {
+      size_t tab = line.find('\t', p);
+      cols.push_back(line.substr(p, (tab == string::npos) ? string::npos
+                                                          : tab - p));
+      if (tab == string::npos)
+        break;
+      p = tab + 1;
+    }
+    while (!cols.empty() && cols.back().empty())
+      cols.pop_back();
+    if (cols.size() < 3)
+      continue;
+
+    predict::RawEntry entry;
+    entry.text = cols[1];
+    entry.weight = atof(cols[2].c_str());
+    if (entry.text.empty())
+      continue;
+    data[cols[0]].push_back(entry);
+
+    if (cols.size() >= 4 && !cols[3].empty()) {
+      codes[entry.text] = cols[3];
+      vector<int> bounds;
+      SplitCodeIntoBoundaries(cols[3], &bounds);
+      code_boundaries[entry.text] = bounds;
+      has_v2 = true;
+    }
+  }
+
+  if (data.empty()) {
+    LOG(ERROR) << "BuildPredictDbFromText: no usable entries";
+    return false;
+  }
+
+  PredictDb db(db_path);
+  bool ok = has_v2 ? db.BuildV2(data, codes, code_boundaries) : db.Build(data);
+  if (!ok || !db.Save()) {
+    LOG(ERROR) << "BuildPredictDbFromText: failed to build " << db_path.string();
+    return false;
+  }
+  LOG(INFO) << "BuildPredictDbFromText: built " << db_path.string()
+            << (has_v2 ? " (v2)" : " (v1)");
+  return true;
 }
 
 }  // namespace rime

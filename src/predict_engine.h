@@ -25,8 +25,15 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   int max_iterations() const { return max_iterations_; }
   int max_candidates() const { return max_candidates_; }
   const string& query() const { return query_; }
-  int num_candidates() const { return candidates_ ? candidates_->size : 0; }
+  /** v2 词库：按当前输入重排后的候选；v1 词库回落到原始顺序。 */
+  const vector<string>& ranked_candidates() const { return ranked_; }
+  int num_candidates() const {
+    return ranked_.empty() ? (candidates_ ? candidates_->size : 0)
+                           : int(ranked_.size());
+  }
   string candidate(size_t i) const {
+    if (!ranked_.empty())
+      return i < ranked_.size() ? ranked_[i] : string();
     return candidates_ ? db_->GetEntryText(candidates_->at[i]) : string();
   }
 
@@ -36,6 +43,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   int max_candidates_;  // prediction candidate count limit
   string query_;        // cache last query
   const predict::Candidates* candidates_ = nullptr;  // cache last result
+  vector<string> ranked_;  // v2: re-ranked candidates for the current input
 };
 
 class PredictEngineComponent : public PredictEngine::Component {

@@ -31,10 +31,12 @@ an<Translation> PredictTranslator::Query(const string& input,
     auto translation = New<FifoTranslation>();
     size_t end = segment.end;
     for (int i = 0; i < num_candidates; ++i) {
-      translation->Append(New<SimpleCandidate>("prediction", end, end,
-                                               predict_engine_->candidate(i)));
+      // 先判上限再追加：旧写法在 i == max_candidates 时先塞进去再 break，
+      // 实际比配置多出一个候选。
       if (max_candidates > 0 && i >= max_candidates)
         break;
+      translation->Append(New<SimpleCandidate>("prediction", end, end,
+                                               predict_engine_->candidate(i)));
     }
     return translation;
   }

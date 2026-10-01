@@ -12,6 +12,7 @@
 #include <rime/translation.h>
 #include <rime/schema.h>
 #include <rime/dict/db_pool_impl.h>
+#include <algorithm>
 
 namespace rime {
 
@@ -28,9 +29,27 @@ PredictEngine::~PredictEngine() {}
 
 bool PredictEngine::Predict(Context* ctx, const string& context_query) {
   DLOG(INFO) << "PredictEngine::Predict [" << context_query << "]";
+  ranked_.clear();
+  // 输入中的组合码（用户正在打的拼音）参与重排：它让「打一半就猜」和
+  // 「只打首字母」生效 —— 联想候选按与当前输入的匹配程度分档排序。
+  string input = ctx ? ctx->input() : string();
   if (const auto* candidates = db_->Lookup(context_query)) {
     query_ = context_query;
     candidates_ = candidates;
+    if (db_->has_codes()) {
+      auto ranked = db_->LookupRanked(context_query, input);
+      for (const auto& e : ranked) {
+        // 3 = 与当前输入无关的候选，压到后面但仍保留为联想
+        if (e.tier == 3 && !input.empty())
+          continue;
+        ranked_.push_back(e.text);
+      }
+      // 全是无关候选时不显示，避免顶掉正常拼音候选
+      if (ranked_.empty() && !input.empty()) {
+        Clear();
+        return false;
+      }
+    }
     return true;
   } else {
     Clear();
@@ -42,6 +61,7 @@ void PredictEngine::Clear() {
   DLOG(INFO) << "PredictEngine::Clear";
   query_.clear();
   candidates_ = nullptr;
+  ranked_.clear();
 }
 
 void PredictEngine::CreatePredictSegment(Context* ctx) const {
@@ -60,12 +80,24 @@ an<Translation> PredictEngine::Translate(const Segment& segment) const {
   auto translation = New<FifoTranslation>();
   size_t end = segment.end;
   int i = 0;
+  // v2 词库优先用重排结果（全拼 > 打一半 > 只打首字母）
+  if (!ranked_.empty()) {
+    for (const auto& text : ranked_) {
+      if (max_candidates_ > 0 && i >= max_candidates_)
+        break;
+      translation->Append(New<SimpleCandidate>("prediction", end, end, text));
+      ++i;
+    }
+    return translation;
+  }
+  if (!candidates_)
+    return translation;
   for (auto* it = candidates_->begin(); it != candidates_->end(); ++it) {
-    translation->Append(
-        New<SimpleCandidate>("prediction", end, end, db_->GetEntryText(*it)));
-    i++;
     if (max_candidates_ > 0 && i >= max_candidates_)
       break;
+    translation->Append(
+        New<SimpleCandidate>("prediction", end, end, db_->GetEntryText(*it)));
+    ++i;
   }
   return translation;
 }

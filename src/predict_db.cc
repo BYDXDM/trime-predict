@@ -54,7 +54,8 @@ bool PredictDb::Load() {
   value_trie_ = make_unique<StringTable>(metadata_->value_trie.get(),
                                          metadata_->value_trie_size);
 
-  has_codes_ = boost::starts_with(string(metadata_->format), kPredictFormatV2);
+  has_codes_ =
+      boost::starts_with(string(metadata_->format), predict::kPredictFormatV2);
   return true;
 }
 
@@ -64,7 +65,12 @@ bool PredictDb::Save() {
     LOG(ERROR) << "the trie has not been constructed!";
     return false;
   }
-  return ShrinkToFit();
+  // ShrinkToFit() 会 Resize -> Close()，解除映射；显式刷一次盘，确保此前
+  // 写进映射的字节（尤其是 metadata 区）落盘后再收缩文件。
+  Flush();
+  if (!ShrinkToFit())
+    return false;
+  return true;
 }
 
 int PredictDb::WriteCandidates(const vector<predict::RawEntry>& candidates,
@@ -189,11 +195,24 @@ int PredictDb::WriteCandidatesV2(const vector<predict::RawEntry>& candidates,
       next->code = CreateString(code);
     }
     if (i < bounds.size() && bounds[i].size() >= 2) {
+      // bounds[i] 是 [start0, end0, start1, end1, ...]；只落每个音节的首字符
+      // 下标，读取侧据此直接取首字母，无需再关心音节长度。
       const auto& b = bounds[i];
       size_t n = b.size() / 2;
-      auto* arr = CreateArray<uint32_t>(n);
-      std::copy(b.begin(), b.end(), arr->begin());
-      next->bounds = arr;
+      // CodeBoundaries 内嵌 Array<uint32_t>，尾部是柔性数组；按 n 个元素
+      // 精确申请字节数，避免直接对 Array 结构体做值拷贝（那只会拷到第 1 个）。
+      size_t bytes = sizeof(predict::CodeBoundaries) +
+                     sizeof(uint32_t) * (n > 0 ? n - 1 : 0);
+      auto* cb = reinterpret_cast<predict::CodeBoundaries*>(
+          Allocate<char>(bytes));
+      if (cb) {
+        cb->offsets.size = uint32_t(n);
+        auto* out = cb->offsets.begin();
+        for (size_t k = 0; k < n; ++k) {
+          *out++ = uint32_t(b[k * 2]);
+        }
+        next->bounds = cb;
+      }
     }
     ++next;
   }
@@ -286,22 +305,37 @@ bool PredictDb::BuildV2(const predict::RawData& data,
     return false;
   }
   std::memcpy(key_trie_image, key_trie_->array(), key_trie_image_size);
-  metadata_ = reinterpret_cast<predict::Metadata*>(address());
-  metadata_->key_trie = key_trie_image;
-  metadata_->key_trie_size = key_trie_->size();
+  // 每次写 metadata 都重新取 address()：Allocate() 触发扩容时会重新映射，
+  // 上一轮拿到的裸指针随即失效。OffsetPtr 存的是相对偏移，跨映射仍然有效。
+  {
+    metadata_ = reinterpret_cast<predict::Metadata*>(address());
+    metadata_->key_trie = key_trie_image;
+    metadata_->key_trie_size = uint32_t(key_trie_->size());
+  }
   char* value_trie_image = Allocate<char>(value_trie_image_size);
   if (!value_trie_image) {
     LOG(ERROR) << "Error creating value trie image.";
     return false;
   }
   string_table.Dump(value_trie_image, value_trie_image_size);
-  metadata_ = reinterpret_cast<predict::Metadata*>(address());
-  metadata_->value_trie = value_trie_image;
-  metadata_->value_trie_size = value_trie_image_size;
-  value_trie_ =
-      make_unique<StringTable>(value_trie_image, value_trie_image_size);
-  std::strncpy(metadata_->format, kPredictFormatV2.c_str(),
-               sizeof(metadata_->format) - 1);
+  {
+    // 上面这次 Allocate 可能又移动了映射，key_trie_image 也需要重新定位。
+    // 偏移量在旧映射上是确定的，换算方式与新映射一致，故用同一 offset 重算。
+    metadata_ = reinterpret_cast<predict::Metadata*>(address());
+    metadata_->value_trie = value_trie_image;
+    metadata_->value_trie_size = uint32_t(value_trie_image_size);
+    value_trie_ =
+        make_unique<StringTable>(value_trie_image, value_trie_image_size);
+  }
+  // 格式串放在**所有分配之后**写。前面每次 Allocate() 都可能 Resize 并重新
+  // 映射，把新映射清零，因此只有最后一次重取 address() 才保证落盘。
+  // 这也是之前 format 一直是上一版内容的原因。
+  {
+    metadata_ = reinterpret_cast<predict::Metadata*>(address());
+    std::memset(metadata_->format, 0, sizeof(metadata_->format));
+    std::strncpy(metadata_->format, predict::kPredictFormatV2,
+                 sizeof(metadata_->format) - 1);
+  }
   has_codes_ = true;
   return true;
 }
@@ -325,7 +359,9 @@ vector<PredictDb::RankedEntry> PredictDb::LookupRanked(const string& key,
     // 首字母串：按 bounds 记录的音节起点取每个音节的首字符
     string initials;
     if (it->bounds) {
-      for (auto b = it->bounds->begin(); b != it->bounds->end(); b += 2) {
+      // bounds->offsets 存的是「每个音节的首字符下标」序列
+      for (auto b = it->bounds->offsets.begin();
+           b != it->bounds->offsets.end(); ++b) {
         size_t start = *b;
         if (start < code.size())
           initials.push_back(code[start]);

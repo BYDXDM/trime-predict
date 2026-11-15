@@ -1,5 +1,6 @@
 #include "predict_db.h"
 #include <algorithm>
+#include <cstring>
 #include <boost/algorithm/string.hpp>
 #include <darts.h>
 #include <rime/resource.h>
@@ -10,6 +11,82 @@ namespace rime {
 
 const string kPredictFormat = "Rime::Predict/1.0";
 const string kPredictFormatPrefix = "Rime::Predict/";
+
+namespace {
+
+/** 有界 strlen：format 是定长 char[32]，没有终止符时不能交给 string()。 */
+size_t BoundedStrLen(const char* str, size_t max_length) {
+  size_t length = 0;
+  while (length < max_length && str[length]) {
+    ++length;
+  }
+  return length;
+}
+
+}  // namespace
+
+bool PredictDb::Reject(const string& reason) {
+  LOG(ERROR) << "rejecting predict db '" << file_path() << "': " << reason;
+  metadata_ = nullptr;
+  key_trie_->clear();
+  value_trie_.reset();
+  has_codes_ = false;
+  Close();
+  return false;
+}
+
+bool PredictDb::CheckRange(const void* ptr, size_t bytes) const {
+  if (!ptr || !IsOpen())
+    return false;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(address());
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+  if (addr < base)
+    return false;
+  const size_t offset = static_cast<size_t>(addr - base);
+  const size_t size = file_size();
+  if (offset > size)
+    return false;
+  // 写成减法比较，offset + bytes 就不会有溢出问题。
+  return bytes <= size - offset;
+}
+
+bool PredictDb::CheckCString(const char* str) const {
+  if (!CheckRange(str, 1))
+    return false;
+  const size_t offset = static_cast<size_t>(
+      reinterpret_cast<uintptr_t>(str) - reinterpret_cast<uintptr_t>(address()));
+  return std::memchr(str, '\0', file_size() - offset) != nullptr;
+}
+
+const void* PredictDb::Resolve(size_t offset) const {
+  if (!IsOpen() || offset > file_size())
+    return nullptr;
+  return address() + offset;
+}
+
+int PredictDb::FindKeyOffset(const string& key) const {
+  const size_t unit_count = key_trie_->size();
+  const auto* units =
+      static_cast<const Darts::Details::DoubleArrayUnit*>(key_trie_->array());
+  if (!units || unit_count == 0)
+    return -1;
+  size_t node = 0;
+  auto unit = units[node];
+  for (size_t i = 0; i < key.size(); ++i) {
+    node ^= unit.offset() ^ static_cast<unsigned char>(key[i]);
+    if (node >= unit_count)
+      return -1;
+    unit = units[node];
+    if (unit.label() != static_cast<unsigned char>(key[i]))
+      return -1;
+  }
+  if (!unit.has_leaf())
+    return -1;
+  node ^= unit.offset();
+  if (node >= unit_count)
+    return -1;
+  return static_cast<int>(units[node].value());
+}
 
 bool PredictDb::Load() {
   LOG(INFO) << "loading predict db: " << file_path();
@@ -22,40 +99,59 @@ bool PredictDb::Load() {
     return false;
   }
 
+  // 文件里每个字段都是「相对偏移 + 长度」，任何一处损坏都会让后续解引用跑到
+  // 映射区外 —— 那是访问冲突，不是可捕获的异常。所以按实际格式契约逐段校验，
+  // 校验不过就拒绝加载：宁可没有联想词，也不能崩。
+  if (file_size() < sizeof(predict::Metadata))
+    return Reject("file is too small for metadata");
+
   metadata_ = Find<predict::Metadata>(0);
-  if (!metadata_) {
-    LOG(ERROR) << "metadata not found.";
-    Close();
-    return false;
+  if (!metadata_)
+    return Reject("metadata not found");
+
+  if (BoundedStrLen(metadata_->format, predict::Metadata::kFormatMaxLength) ==
+      predict::Metadata::kFormatMaxLength)
+    return Reject("format is not terminated");
+  const string format(metadata_->format);
+  if (format != kPredictFormat && format != predict::kPredictFormatV2)
+    return Reject("unsupported format: " + format);
+  has_codes_ = format == predict::kPredictFormatV2;
+
+  // key_trie：Darts 的 size 是 unit 数（每 unit 4 字节）。实际生成的库里这个
+  // 偏移并不保证 4 字节对齐，所以只校验区间，不因对齐拒绝。
+  const size_t unit_size = sizeof(Darts::Details::DoubleArrayUnit);
+  if (!metadata_->key_trie)
+    return Reject("double array image not found");
+  if (metadata_->key_trie_size == 0 ||
+      metadata_->key_trie_size > file_size() / unit_size)
+    return Reject("double array image size out of range");
+  {
+    const char* image = metadata_->key_trie.get();
+    if (!CheckRange(image, static_cast<size_t>(metadata_->key_trie_size) *
+                               unit_size))
+      return Reject("double array image out of range");
+    DLOG(INFO) << "found double array image of " << metadata_->key_trie_size
+               << " units.";
+    key_trie_->set_array(image, metadata_->key_trie_size);
   }
 
-  if (!boost::starts_with(string(metadata_->format), kPredictFormatPrefix)) {
-    LOG(ERROR) << "invalid metadata.";
-    Close();
-    return false;
+  if (!metadata_->value_trie)
+    return Reject("string table not found");
+  {
+    const char* image = metadata_->value_trie.get();
+    if (metadata_->value_trie_size == 0 ||
+        !CheckRange(image, metadata_->value_trie_size))
+      return Reject("string table out of range");
+    DLOG(INFO) << "found string table of size " << metadata_->value_trie_size
+               << ".";
+    // marisa 自己会校验头部（坏数据抛 marisa::Exception）；这里把异常转成
+    // 「拒绝加载」，不让它冒到 JNI 调用栈上。
+    try {
+      value_trie_ = make_unique<StringTable>(image, metadata_->value_trie_size);
+    } catch (const std::exception& e) {
+      return Reject(string("invalid string table: ") + e.what());
+    }
   }
-
-  if (!metadata_->key_trie) {
-    LOG(ERROR) << "double array image not found.";
-    Close();
-    return false;
-  }
-  DLOG(INFO) << "found double array image of size " << metadata_->key_trie_size
-             << ".";
-  key_trie_->set_array(metadata_->key_trie.get(), metadata_->key_trie_size);
-
-  if (!metadata_->value_trie) {
-    LOG(ERROR) << "string table not found.";
-    Close();
-    return false;
-  }
-  DLOG(INFO) << "found string table of size " << metadata_->value_trie.get()
-             << ".";
-  value_trie_ = make_unique<StringTable>(metadata_->value_trie.get(),
-                                         metadata_->value_trie_size);
-
-  has_codes_ =
-      boost::starts_with(string(metadata_->format), predict::kPredictFormatV2);
   return true;
 }
 
@@ -168,15 +264,27 @@ bool PredictDb::Build(const predict::RawData& data) {
 }
 
 predict::Candidates* PredictDb::Lookup(const string& query) {
-  int result = key_trie_->exactMatchSearch<int>(query.c_str());
-  if (result == -1)
+  const int result = FindKeyOffset(query);
+  if (result < 0)
     return nullptr;
-  else
-    return Find<predict::Candidates>(result);
+  size_t count = 0;
+  auto* candidates = CheckArray<table::Entry>(Resolve(result), &count);
+  if (!candidates) {
+    LOG(WARNING) << "predict db: candidate array out of range: " << result;
+    return nullptr;
+  }
+  return candidates;
 }
 
 string PredictDb::GetEntryText(const ::rime::table::Entry& entry) {
-  return value_trie_->GetString(entry.text.str_id());
+  // text 存的是字符串表里的 key id，坏库里可以是任意值。
+  const StringId id = entry.text.str_id();
+  if (!value_trie_ || id < 0 ||
+      static_cast<size_t>(id) >= value_trie_->NumKeys()) {
+    LOG(WARNING) << "predict db: string id out of range: " << id;
+    return string();
+  }
+  return value_trie_->GetString(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,30 +451,58 @@ bool PredictDb::BuildV2(const predict::RawData& data,
 vector<PredictDb::RankedEntry> PredictDb::LookupRanked(const string& key,
                                                        const string& input) {
   vector<RankedEntry> result;
-  int offset = key_trie_->exactMatchSearch<int>(key.c_str());
-  if (offset == -1)
+  const int offset = FindKeyOffset(key);
+  if (offset < 0)
     return result;
-  auto* candidates = Find<predict::CandidatesV2>(offset);
-  if (!candidates)
+  size_t count = 0;
+  auto* candidates = CheckArray<predict::EntryV2>(Resolve(offset), &count);
+  if (!candidates) {
+    LOG(WARNING) << "predict db: candidate array out of range: " << offset;
     return result;
+  }
 
-  for (auto it = candidates->entries.begin(); it != candidates->entries.end();
-       ++it) {
+  size_t skipped_without_text = 0;
+  for (auto it = candidates->begin(); it != candidates->end(); ++it) {
     RankedEntry e;
     e.text = GetEntryText(it->base);
+    // R4: 文本取不出来（坏库里的越界/悬空偏移）时不要塞进候选列表，否则上屏是空串。
+    // 正常库里每条都有文本，这里不改变行为。
+    if (e.text.empty()) {
+      ++skipped_without_text;
+      continue;
+    }
     e.weight = it->base.weight;
-    string code = (it->code && !it->code->empty()) ? it->code->c_str() : "";
+    // code / bounds 同样是相对偏移，解引用前先确认整段落在文件内。
+    string code;
+    if (it->code) {
+      if (!CheckRange(it->code.get(), sizeof(String))) {
+        LOG(WARNING) << "predict db: entry code out of range";
+      } else if (it->code->data && CheckCString(it->code->c_str())) {
+        code = it->code->c_str();
+      } else if (it->code->data) {
+        LOG(WARNING) << "predict db: entry code is not terminated";
+      }
+    }
     // 首字母串：按 bounds 记录的音节起点取每个音节的首字符
     string initials;
-    if (it->bounds) {
+    bool have_bounds = false;
+    if (it->bounds &&
+        CheckRange(it->bounds.get(), sizeof(predict::CodeBoundaries))) {
       // bounds->offsets 存的是「每个音节的首字符下标」序列
-      for (auto b = it->bounds->offsets.begin();
-           b != it->bounds->offsets.end(); ++b) {
-        size_t start = *b;
-        if (start < code.size())
-          initials.push_back(code[start]);
+      size_t bounds_count = 0;
+      if (auto* bounds =
+              CheckArray<uint32_t>(&it->bounds->offsets, &bounds_count)) {
+        for (auto b = bounds->begin(); b != bounds->end(); ++b) {
+          size_t start = *b;
+          if (start < code.size())
+            initials.push_back(code[start]);
+        }
+        have_bounds = true;
+      } else {
+        LOG(WARNING) << "predict db: entry bounds out of range";
       }
-    } else {
+    }
+    if (!have_bounds) {
       for (size_t p = 0; p < code.size(); ++p) {
         if (p == 0 || code[p - 1] == ' ')
           initials.push_back(code[p]);
@@ -388,6 +524,9 @@ vector<PredictDb::RankedEntry> PredictDb::LookupRanked(const string& key,
     }
     result.push_back(std::move(e));
   }
+  if (skipped_without_text > 0)
+    LOG(WARNING) << "predict db: skipped " << skipped_without_text
+                 << " entries without text";
   // 档位优先，其次「更长的输入前缀」，最后比词频
   std::stable_sort(result.begin(), result.end(),
                    [](const RankedEntry& a, const RankedEntry& b) {

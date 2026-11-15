@@ -1,6 +1,7 @@
 #ifndef RIME_PREDICT_DB_H_
 #define RIME_PREDICT_DB_H_
 
+#include <cstdint>
 #include <darts.h>
 #include <rime/resource.h>
 #include <rime/dict/mapped_file.h>
@@ -98,6 +99,41 @@ class PredictDb : public MappedFile {
                         const vector<string>& codes,
                         const vector<vector<int>>& bounds,
                         const table::Entry* entry);
+
+  /** 校验 [ptr, ptr + bytes) 整段落在映射文件内（相对 address() 计算）。 */
+  bool CheckRange(const void* ptr, size_t bytes) const;
+  /** 校验以 NUL 结尾的字符串完整落在文件内。 */
+  bool CheckCString(const char* str) const;
+  /** 把 trie 里存的相对偏移换算成指针；越界返回 nullptr。 */
+  const void* Resolve(size_t offset) const;
+  /**
+   * 校验一个 Array<T> 区间：size 字段与 size 个元素都必须落在文件内。
+   * 字节数沿用 MappedFile::CreateArray 的公式
+   * sizeof(Array<T>) + sizeof(T) * (size - 1)，与写入方保持一致。
+   */
+  template <class T>
+  Array<T>* CheckArray(const void* array, size_t* count) const {
+    if (!array || !CheckRange(array, sizeof(Array<T>)))
+      return nullptr;
+    const size_t n = static_cast<const Array<T>*>(array)->size;
+    if (n == 0)
+      return nullptr;
+    const size_t offset = reinterpret_cast<uintptr_t>(array) -
+                          reinterpret_cast<uintptr_t>(address());
+    const size_t avail = file_size() - offset - sizeof(Array<T>);
+    if (n - 1 > avail / sizeof(T))
+      return nullptr;
+    *count = n;
+    return reinterpret_cast<Array<T>*>(const_cast<void*>(array));
+  }
+  /**
+   * 在 Darts 双数组上做与 exactMatchSearch 等价的查找，但每一步都先确认节点
+   * 下标落在 trie 区间内：损坏的 unit.offset() 会把原生查找的下标推出数组，
+   * 那是访问冲突（SIGSEGV），不是可以 catch 的异常。
+   */
+  int FindKeyOffset(const string& key) const;
+  /** 拒绝加载：清掉已建立的视图并返回 false。 */
+  bool Reject(const string& reason);
 
   predict::Metadata* metadata_ = nullptr;
   the<Darts::DoubleArray> key_trie_;
